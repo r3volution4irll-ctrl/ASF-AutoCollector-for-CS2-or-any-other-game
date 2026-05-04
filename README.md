@@ -14,7 +14,7 @@ Cheers
 # AutoCollectASF
 
 A Python script that automatically drains CS:GO tradable items from all your ArchiSteamFarm (ASF) bot accounts into a central storage account, and prints a full summary of everything that was collected.
-
+THIS MAY TAKE A LONG TIME. There are multiple random delays between steps of this script, so the more bots you have, the longer this may take. On 10 Bots it may take 5 to 10 minutes. on 120 Bots it could take a few hours. 
 ---
 
 ## Table of Contents
