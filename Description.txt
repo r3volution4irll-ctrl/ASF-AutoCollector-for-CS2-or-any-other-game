@@ -1,0 +1,241 @@
+================================================================================
+  AutoCollectASF — Technical Program Description
+================================================================================
+
+OVERVIEW
+--------
+AutoCollectASF is a Python automation script that interfaces with a locally
+running ArchiSteamFarm (ASF) instance to consolidate CS:GO (Counter-Strike 2)
+tradable items from multiple Steam bot accounts into one or more designated
+storage/main accounts. It does this by issuing ASF loot commands, scanning bot
+inventories beforehand to record what was sent, and printing a final summary.
+
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+  - Python 3.x
+  - requests          (HTTP calls to ASF IPC API and Steam Community API)
+  - collections.Counter (item counting/aggregation)
+  - os, time, random  (file system access, delays, randomization)
+
+ASF must be running locally and its IPC interface must be enabled and accessible
+at http://127.0.0.1:1242 before the script is executed.
+
+
+--------------------------------------------------------------------------------
+CONFIGURATION (top of script)
+--------------------------------------------------------------------------------
+
+  config_path         Path to the ASF config folder (default: "./config").
+                      The script discovers bot accounts by listing all .json
+                      files in this folder (excluding "ASF.json" and "Manifest.json" or any other Manifest file).
+
+  ASF_BASE_URL        Base URL of the ASF IPC server (default: 127.0.0.1:1242).
+  ASF_IPC_URL         Full endpoint for issuing ASF commands via HTTP POST.
+                      Resolves to: {ASF_BASE_URL}/Api/Command
+
+  APP_ID              Steam application ID to scope inventory and loot commands.
+                      Set to 730 (CS:GO / Counter-Strike 2).
+
+  CONTEXT_ID          Steam inventory context ID. Set to 2, which corresponds
+                      to tradable in-game items in the CS:GO inventory.
+
+  exclude_bots        List of bot names (case-insensitive) to exclude from the
+                      worker bot pool. These are typically storage/main accounts
+                      that receive items rather than send them.
+
+  storage_accounts    Dictionary mapping display names to Steam64 IDs for the
+                      storage/main accounts. Used only for labeling output.
+
+  min_delay /         Minimum and maximum seconds to wait between loot commands
+  max_delay           (default: 7–25 seconds). Randomized per bot.
+
+  inventory_delay_    Minimum and maximum seconds to wait between ASF inventory
+  min / max           API requests (default: 7–20 seconds). ASF forwards these
+                      to Steam's inventory endpoint, which rate-limits at the
+                      IP level. Randomized.
+
+  COMMAND_TIMEOUT     HTTP read timeout (seconds) for loot^ commands sent to
+                      ASF (default: 180 s). The loot^ command is synchronous —
+                      ASF holds the response open until the trade offer has been
+                      created and mobile-confirmed. Under load this regularly
+                      takes 60–120 s. Setting this too low causes false failures.
+
+  INVENTORY_TIMEOUT   HTTP read timeout (seconds) for ASF inventory API calls
+                      (default: 60 s). Large paginated inventories can be slow.
+
+  FILTER_KEYWORDS     Optional list of strings. If non-empty, only items whose
+                      market_hash_name contains at least one keyword (case-
+                      insensitive) will be included in inventory results.
+                      If empty, all items are included.
+
+
+--------------------------------------------------------------------------------
+BOT DISCOVERY
+--------------------------------------------------------------------------------
+On startup, the script scans the ./config directory for all .json files except
+ASF.json. Each remaining filename (without extension) is treated as a bot name.
+Any bot whose name appears in exclude_bots (case-insensitive match) is skipped.
+The resulting list is sorted alphabetically before processing begins.
+
+Example: if config/ contains  BotA.json, BotB.json, ASF.json, MyStorageAccount.json
+and exclude_bots = ["MyStorageAccount"], then bots = ["BotA", "BotB"].
+
+
+--------------------------------------------------------------------------------
+EXECUTION FLOW
+--------------------------------------------------------------------------------
+
+STEP 1 — SCAN BOT INVENTORIES (pre-loot snapshot)
+  For each bot, the script fetches that bot's CS:GO inventory through ASF's
+  own IPC API endpoint:
+    GET {ASF_BASE_URL}/Api/Bot/{bot_name}/Inventory/{APP_ID}/{CONTEXT_ID}
+
+  This avoids hitting Steam's public inventory API directly from the script's
+  IP and delegates session management entirely to ASF.
+
+  For each asset in the response, the script maps (classid, instanceid) pairs
+  to market_hash_name strings using the "Descriptions" array in the response.
+  The amount field on each asset is respected (stacked items count as N copies).
+
+  If FILTER_KEYWORDS is set, only matching item names are retained.
+
+  A 7–20 second random delay is inserted between each bot's inventory request
+  to avoid hitting Steam's per-IP rate limits.
+
+  Result: a per-bot Counter object mapping item names → quantity. These form
+  the pre-loot baseline used later to confirm delivery.
+
+
+STEP 2 — EXECUTE LOOT COMMANDS
+  For each bot in the list, the script sends the following ASF IPC command via
+  HTTP POST to {ASF_IPC_URL}:
+    {"Command": "loot^ {bot_name} 730 2"}
+
+  The "loot^" command instructs ASF to transfer all tradable CS:GO items
+  (App 730, Context 2) from the named bot to its configured master account.
+  The trailing ^ makes the command synchronous: ASF holds the HTTP response
+  open until the trade offer has been created and mobile-confirmed by ASF.
+
+  The script uses a (connect=10 s, read=COMMAND_TIMEOUT) timeout pair.
+  Because loot^ is synchronous and Steam's trade API can be slow under load,
+  COMMAND_TIMEOUT defaults to 180 s.
+
+  Each loot command produces one of three outcomes:
+    "ok"      — ASF returned HTTP 200 with no error keywords in the result.
+    "failed"  — HTTP non-200, ASF error message, or connection error. The
+                trade definitively did not go through.
+    "timeout" — The local HTTP read exceeded COMMAND_TIMEOUT. This does NOT
+                mean the trade failed — ASF is almost certainly still
+                processing it. Resolution is deferred to Step 4.
+
+  A random delay of 7–25 seconds is inserted between each loot command.
+
+
+STEP 3 — POST-LOOT INVENTORY SCAN
+  After all loot commands have been dispatched, the script re-fetches each
+  bot's inventory using the same ASF IPC endpoint as Step 1.
+
+  The resulting per-bot Counters are stored as the post-loot baseline.
+
+
+STEP 4 — RESOLVE TIMEOUT BOTS
+  For each bot whose loot^ timed out ("timeout" outcome in Step 2), the script
+  computes the inventory delta:
+    delta = before (Step 1 snapshot) - after (Step 3 snapshot)
+
+  If delta > 0 and the bot's inventory is now empty:
+    → Trade succeeded. The HTTP timeout was a false alarm. Bot is cleared.
+  If delta > 0 but items remain:
+    → Trade partially completed. Bot is added to the redo list.
+  If delta == 0:
+    → Nothing moved. Trade did not complete. Bot is added to the redo list.
+
+
+STEP 5 — PRINT RESULTS SUMMARY
+  The script prints a consolidated summary comparing the pre-loot and post-loot
+  snapshots:
+    - CONFIRMED SENT: items that left the bots (before - after delta).
+    - STILL ON BOTS: items that did not move, with which bots still hold them.
+  Failed bots and unresolved timeout bots are listed separately for retry.
+
+
+--------------------------------------------------------------------------------
+WHAT THE SCRIPT DOES NOT DO
+--------------------------------------------------------------------------------
+  - Does NOT scan storage account inventories. The output only shows items
+    collected from bots in the current run, not running totals in the stash.
+  - Does NOT retry failed bots automatically. Failed bots are logged to console;
+    re-running the script handles any leftover bots.
+  - Does NOT authenticate with Steam directly. All Steam trade actions go through
+    ASF, which manages sessions and 2FA internally.
+  - Does NOT filter by item value, float, or rarity — it transfers everything
+    (unless FILTER_KEYWORDS is configured).
+  - Does NOT modify ASF config files or bot settings.
+
+
+--------------------------------------------------------------------------------
+ERROR HANDLING
+--------------------------------------------------------------------------------
+  - If ASF is unreachable (ConnectionError), each loot command is marked
+    "failed" and the script continues with remaining bots.
+  - If the HTTP read for loot^ exceeds COMMAND_TIMEOUT, the result is marked
+    "timeout" rather than "failed". The post-loot inventory scan (Step 3)
+    is used to determine whether the trade actually completed.
+  - If the ASF inventory endpoint is unreachable or returns malformed JSON,
+    the inventory for that bot is treated as empty and processing continues.
+  - Bots marked "failed" or "unresolved timeout" after the inventory
+    verification are listed at the end of the output for manual retry.
+
+
+--------------------------------------------------------------------------------
+OUTPUT FORMAT (console)
+--------------------------------------------------------------------------------
+  The script uses emoji-prefixed log lines for readability:
+    ⏳  Random delay in progress
+    🚀  Loot command being sent for a specific bot
+    ✅  Loot command confirmed succeeded
+    ⏱️  Loot command HTTP read timed out (trade still being verified)
+    ❌  Loot command hard-failed (connection error or ASF error response)
+    ⚠️  Warning (e.g. rate limit, inventory unavailable)
+    💀  Bot inventory was completely empty
+    🔍  Inventory scan in progress
+    🤖  Bot inventory scanning phase start
+    🧾  Final summary section start
+    📋  Per-account summary block
+
+  All other Prints should be formulated in a strong New York slang.
+
+  Example summary output:
+    📋 Masteraccount:
+      Masteraccount got : 42x Clutch Case
+      Masteraccount got : 17x Danger Zone Case
+      Masteraccount got : 5x CS:GO Weapon Case
+
+
+--------------------------------------------------------------------------------
+TYPICAL USE CASE
+--------------------------------------------------------------------------------
+  1. ASF is running with N bot accounts that have accumulated CS:GO item drops.
+  2. User runs: python AutoCollectScript.py
+  3. Script scans each bot's inventory to record what is there.
+  4. Script sends loot^ commands to drain all bots into the master/storage account.
+  5. Script prints a summary of every item transferred in this session.
+  6. User can schedule this script via cron / Task Scheduler for periodic runs.
+
+
+--------------------------------------------------------------------------------
+SECURITY NOTES
+--------------------------------------------------------------------------------
+  - The ASF IPC endpoint is bound to localhost (127.0.0.1) only. Do not expose
+    it on a public network interface without authentication.
+  - Steam64 IDs and bot names appear in console output — avoid running in shared
+    or logged terminal environments if privacy is a concern.
+  - No credentials or API keys are stored or transmitted by this script directly;
+    all authentication is delegated to ASF.
+
+
+================================================================================
+END OF DESCRIPTION
+================================================================================
